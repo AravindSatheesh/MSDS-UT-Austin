@@ -7,12 +7,19 @@ HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD = [0.2064, 0.1944, 0.2252]
 
-
+def conv_bn_relu(in_c, out_c, k=3, s=1, p=1):
+    return nn.Sequential(
+        nn.Conv2d(in_c, out_c, kernel_size=k, stride=s, padding=p, bias=False),
+        nn.BatchNorm2d(out_c),
+        nn.ReLU(inplace=True),
+    )
 class Classifier(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
         num_classes: int = 6,
+        width: int = 32,
+        dropout: float = 0.2,
     ):
         """
         A convolutional network for image classification.
@@ -26,8 +33,38 @@ class Classifier(nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # TODO: implement
-        pass
+        C = width
+        self.stem = conv_bn_relu(in_channels, C, 3, 1, 1)
+
+        self.block1 = nn.Sequential(
+            conv_bn_relu(C, C, 3, 1, 1),
+            conv_bn_relu(C, C, 3, 1, 1),
+            nn.MaxPool2d(2),  # 64 -> 32
+            nn.Dropout(dropout),
+        )
+        self.block2 = nn.Sequential(
+            conv_bn_relu(C, C*2, 3, 1, 1),
+            conv_bn_relu(C*2, C*2, 3, 1, 1),
+            nn.MaxPool2d(2),  # 32 -> 16
+            nn.Dropout(dropout),
+        )
+        self.block3 = nn.Sequential(
+            conv_bn_relu(C*2, C*4, 3, 1, 1),
+            conv_bn_relu(C*4, C*4, 3, 1, 1),
+            nn.AdaptiveAvgPool2d(1),  # -> (B, C*4, 1, 1)
+        )
+        self.classifier = nn.Linear(C*4, num_classes)
+
+        # init
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -40,8 +77,12 @@ class Classifier(nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 6)
+        z = self.stem(z)
+        z = self.block1(z)
+        z = self.block2(z)
+        z = self.block3(z)
+        z = torch.flatten(z, 1)
+        logits = self.classifier(z)
 
         return logits
 
@@ -59,12 +100,33 @@ class Classifier(nn.Module):
         """
         return self(x).argmax(dim=1)
 
+class UpBlock(nn.Module):
+    """ConvTranspose2d upsample + convs (with skip)"""
+    def __init__(self, in_c, skip_c, out_c):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2)
+        self.conv = nn.Sequential(
+            conv_bn_relu(out_c + skip_c, out_c, 3, 1, 1),
+            conv_bn_relu(out_c, out_c, 3, 1, 1),
+        )
 
+    def forward(self, x, skip):
+        x = self.up(x)
+        # handle odd input sizes by center-cropping skip if needed
+        if x.size(-1) != skip.size(-1) or x.size(-2) != skip.size(-2):
+            dh = skip.size(-2) - x.size(-2)
+            dw = skip.size(-1) - x.size(-1)
+            skip = skip[..., dh//2: skip.size(-2) - (dh - dh//2), dw//2: skip.size(-1) - (dw - dw//2)]
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+    
 class Detector(torch.nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
         num_classes: int = 3,
+        width: int = 16,
+        depth_head_act: str = "sigmoid",  # ensures [0,1]
     ):
         """
         A single model that performs segmentation and depth regression
@@ -78,8 +140,42 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # TODO: implement
-        pass
+        C = width
+        # Encoder
+        self.enc1 = nn.Sequential(conv_bn_relu(in_channels, C, 3, 1, 1),
+                                  conv_bn_relu(C, C, 3, 1, 1))
+        self.down1 = nn.Conv2d(C, C*2, kernel_size=3, stride=2, padding=1)  # /2
+        self.enc2 = nn.Sequential(conv_bn_relu(C*2, C*2, 3, 1, 1),
+                                  conv_bn_relu(C*2, C*2, 3, 1, 1))
+        self.down2 = nn.Conv2d(C*2, C*4, kernel_size=3, stride=2, padding=1)  # /4
+        self.enc3 = nn.Sequential(conv_bn_relu(C*4, C*4, 3, 1, 1),
+                                  conv_bn_relu(C*4, C*4, 3, 1, 1))
+
+        # Decoder
+        self.up1 = UpBlock(C*4, C*2, C*2)  # -> /2
+        self.up2 = UpBlock(C*2, C, C)      # -> /1
+
+        # Heads
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(C, C, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(C, num_classes, 1),
+        )
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(C, C, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(C, 1, 1),
+        )
+        self.depth_head_act = depth_head_act
+
+        # init
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -97,9 +193,21 @@ class Detector(torch.nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 3, x.size(2), x.size(3))
-        raw_depth = torch.rand(x.size(0), x.size(2), x.size(3))
+        # Encoder
+        e1 = self.enc1(z)              # (B, C, H, W)
+        e2 = self.enc2(self.down1(e1)) # (B, 2C, H/2, W/2)
+        b  = self.enc3(self.down2(e2)) # (B, 4C, H/4, W/4)
+
+        # Decoder with skips
+        d1 = self.up1(b, e2)           # (B, 2C, H/2, W/2)
+        d2 = self.up2(d1, e1)          # (B, C, H, W)
+
+        logits = self.seg_head(d2)             # (B, num_classes, H, W)
+
+        depth = self.depth_head(d2)                # (B, 1, H, W)
+        if self.depth_head_act == "sigmoid":
+            depth = depth.sigmoid()
+        raw_depth = depth.squeeze(1)
 
         return logits, raw_depth
 
